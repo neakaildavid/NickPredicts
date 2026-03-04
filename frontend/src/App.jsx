@@ -1,6 +1,5 @@
 import { useState, useRef } from "react";
 
-// ─── Labels & directions for rawMetrics keys ────────────────────────────────
 const METRIC_CONFIG = {
   dcf_margin_of_safety: { label: "DCF Margin of Safety", fmt: "pct", higher_is_better: true  },
   pe_ratio:             { label: "P/E Ratio",             fmt: "x",   higher_is_better: false },
@@ -15,7 +14,6 @@ const METRIC_CONFIG = {
   rsi14:                { label: "RSI-14",                fmt: "raw", higher_is_better: null  },
 };
 
-
 const PILLAR_LABELS = { value: "VALUE", growth: "GROWTH", momentum: "MOMENTUM" };
 
 const STEPS = [
@@ -27,19 +25,18 @@ const STEPS = [
   "Calculating buy probability",
 ];
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 function fmtValue(v, fmt) {
   if (v === null || v === undefined) return "—";
-  if (fmt === "pct")  return (v * 100).toFixed(1) + "%";
-  if (fmt === "x")    return v.toFixed(1) + "x";
-  if (fmt === "dec")  return v.toFixed(3);
-  if (fmt === "raw")  return v.toFixed(1);
+  if (fmt === "pct") return (v * 100).toFixed(1) + "%";
+  if (fmt === "x")   return v.toFixed(1) + "x";
+  if (fmt === "dec") return v.toFixed(3);
+  if (fmt === "raw") return v.toFixed(1);
   return String(v);
 }
 
 function metricColor(value, higher_is_better) {
-  if (higher_is_better === null) return "#94a3b8"; // neutral (RSI)
-  // z-score the "goodness" direction
+  if (higher_is_better === null) return "#94a3b8";
   return higher_is_better
     ? value >= 0 ? "#4ade80" : "#f87171"
     : value <= 0 ? "#4ade80" : "#f87171";
@@ -52,67 +49,95 @@ const verdictColor = v =>
   : v === "SELL"     ? "#fca5a5"
   : "#f87171";
 
-// ─── Gauge ──────────────────────────────────────────────────────────────────
-function GaugeArc({ probability }) {
-  // Half-circle gauge. 0% → left end, 100% → right end.
-  // We draw in a 220×130 viewBox with extra bottom padding so nothing clips.
-  const cx = 110, cy = 110, r = 88;
-  const clamp = Math.max(0, Math.min(1, probability));
-  // angle: 0% = π (left), 100% = 0 (right), so angle = π - clamp*π
-  const angle  = Math.PI - clamp * Math.PI;
-  const arcX   = cx + r * Math.cos(angle);
-  const arcY   = cy + r * Math.sin(angle);
-  const needleLen = 70;
-  const nx = cx + needleLen * Math.cos(angle);
-  const ny = cy + needleLen * Math.sin(angle);
+const probColor = p =>
+  p >= 0.65 ? "#4ade80" : p >= 0.45 ? "#facc15" : "#f87171";
 
-  const color =
-    probability >= 0.65 ? "#4ade80"
-    : probability >= 0.45 ? "#facc15"
-    : "#f87171";
-
+// ─── Reusable section label with readable color ───────────────────────────────
+function SectionLabel({ children, style = {} }) {
   return (
-    <svg viewBox="0 0 220 125" style={{ width: "100%", maxWidth: 280 }}>
-      {/* Track */}
-      <path
-        d={`M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${cx + r} ${cy}`}
-        fill="none" stroke="#1e293b" strokeWidth="14" strokeLinecap="round"
-      />
-      {/* Fill */}
-      <path
-        d={`M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${arcX} ${arcY}`}
-        fill="none" stroke={color} strokeWidth="14" strokeLinecap="round"
-        style={{ filter: `drop-shadow(0 0 8px ${color}88)` }}
-      />
-      {/* Needle */}
-      <line
-        x1={cx} y1={cy} x2={nx} y2={ny}
-        stroke="#fff" strokeWidth="2.5" strokeLinecap="round"
-      />
-      <circle cx={cx} cy={cy} r="5" fill="#fff" />
-      {/* Labels */}
-      <text x={cx - r - 2} y={cy + 18} fill="#475569" fontSize="9" fontFamily="monospace">SELL</text>
-      <text x={cx + r - 24} y={cy + 18} fill="#475569" fontSize="9" fontFamily="monospace">BUY</text>
-      {/* Percentage */}
-      <text
-        x={cx} y={cy - 18}
-        textAnchor="middle" fill={color}
-        fontSize="32" fontFamily="'DM Serif Display', serif"
-      >
-        {Math.round(probability * 100)}%
-      </text>
-      <text
-        x={cx} y={cy - 4}
-        textAnchor="middle" fill="#64748b"
-        fontSize="8" fontFamily="monospace" letterSpacing="2"
-      >
-        BUY PROBABILITY
-      </text>
-    </svg>
+    <div style={{
+      fontFamily: "'JetBrains Mono', monospace",
+      fontSize: 10,
+      letterSpacing: 3,
+      color: "#7dd3fc",   // sky-300 — clearly readable on dark bg
+      marginBottom: 12,
+      ...style,
+    }}>
+      {children}
+    </div>
   );
 }
 
-// ─── Step list ───────────────────────────────────────────────────────────────
+// ─── Buy probability: big % + progress bar (replaces gauge) ──────────────────
+function ProbabilityDisplay({ probability }) {
+  const pct   = Math.round((probability || 0) * 100);
+  const color = probColor(probability || 0);
+
+  return (
+    <div style={{ width: "100%", padding: "4px 0 20px" }}>
+      {/* Large percentage */}
+      <div style={{
+        fontFamily: "'DM Serif Display', serif",
+        fontSize: 80,
+        lineHeight: 1,
+        color,
+        textAlign: "center",
+        filter: `drop-shadow(0 0 20px ${color}55)`,
+        marginBottom: 6,
+      }}>
+        {pct}%
+      </div>
+
+      {/* Label */}
+      <div style={{
+        fontFamily: "'JetBrains Mono', monospace",
+        fontSize: 10,
+        letterSpacing: 4,
+        color: "#94a3b8",
+        textAlign: "center",
+        marginBottom: 20,
+      }}>
+        BUY PROBABILITY
+      </div>
+
+      {/* Progress bar track */}
+      <div style={{
+        width: "100%",
+        height: 10,
+        background: "#0f2137",
+        borderRadius: 99,
+        overflow: "hidden",
+        border: "1px solid #1e3a5f",
+      }}>
+        {/* Filled portion */}
+        <div style={{
+          width: `${pct}%`,
+          height: "100%",
+          background: `linear-gradient(90deg, ${color}88, ${color})`,
+          borderRadius: 99,
+          boxShadow: `0 0 10px ${color}66`,
+          transition: "width 0.6s cubic-bezier(0.4,0,0.2,1)",
+        }} />
+      </div>
+
+      {/* SELL / BUY end labels */}
+      <div style={{
+        display: "flex",
+        justifyContent: "space-between",
+        marginTop: 6,
+        fontFamily: "'JetBrains Mono', monospace",
+        fontSize: 9,
+        color: "#64748b",
+        letterSpacing: 2,
+      }}>
+        <span>SELL</span>
+        <span>BUY</span>
+      </div>
+    </div>
+  );
+}
+
+// ─── Step list ────────────────────────────────────────────────────────────────
 function StepList({ currentStep, done }) {
   return (
     <div>
@@ -120,8 +145,10 @@ function StepList({ currentStep, done }) {
         const isDone   = done || i < currentStep;
         const isActive = !done && i === currentStep;
         return (
-          <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10,
-            opacity: isDone || isActive ? 1 : 0.2, transition: "opacity 0.5s" }}>
+          <div key={i} style={{
+            display: "flex", alignItems: "center", gap: 10, marginBottom: 10,
+            opacity: isDone || isActive ? 1 : 0.2, transition: "opacity 0.5s",
+          }}>
             <div style={{
               width: 18, height: 18, borderRadius: "50%", flexShrink: 0,
               background: isDone ? "#4ade80" : isActive ? "transparent" : "#1e293b",
@@ -134,7 +161,8 @@ function StepList({ currentStep, done }) {
             </div>
             <span style={{
               fontFamily: "'JetBrains Mono', monospace", fontSize: 11,
-              color: isDone ? "#4ade80" : isActive ? "#e2e8f0" : "#475569", transition: "color 0.4s",
+              color: isDone ? "#4ade80" : isActive ? "#e2e8f0" : "#475569",
+              transition: "color 0.4s",
             }}>{s}</span>
           </div>
         );
@@ -143,21 +171,35 @@ function StepList({ currentStep, done }) {
   );
 }
 
-// ─── Pillar card ─────────────────────────────────────────────────────────────
+// ─── Pillar card ──────────────────────────────────────────────────────────────
 function PillarCard({ name, data }) {
   const z = data.z_score;
   const color = z === null ? "#94a3b8" : z >= 0.5 ? "#4ade80" : z >= -0.5 ? "#facc15" : "#f87171";
   return (
-    <div style={{ background: "#071528", border: "1px solid #1e3a5f", borderRadius: 3, padding: "14px 16px" }}>
+    <div style={{
+      background: "#071528", border: "1px solid #1e3a5f",
+      borderRadius: 3, padding: "14px 16px",
+    }}>
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 10, letterSpacing: 3, color: "#334155" }}>
+        <span style={{
+          fontFamily: "'JetBrains Mono', monospace",
+          fontSize: 10, letterSpacing: 3,
+          color: "#94a3b8",   // was #334155 — now readable
+        }}>
           {PILLAR_LABELS[name]}
         </span>
-        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color, fontWeight: 500 }}>
+        <span style={{
+          fontFamily: "'JetBrains Mono', monospace",
+          fontSize: 12, color, fontWeight: 500,
+        }}>
           {z !== null ? (z >= 0 ? "+" : "") + z.toFixed(2) : "—"}
         </span>
       </div>
-      <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 9, color: "#334155" }}>
+      <div style={{
+        fontFamily: "'JetBrains Mono', monospace",
+        fontSize: 9,
+        color: "#64748b",   // was #334155 — now readable
+      }}>
         {data.metrics_used.length}/{data.metrics_used.length + data.metrics_missing.length} metrics ·{" "}
         {Math.round(data.effective_weight * 100)}% weight
       </div>
@@ -165,14 +207,11 @@ function PillarCard({ name, data }) {
   );
 }
 
-// ─── Metric row ──────────────────────────────────────────────────────────────
+// ─── Metric row ───────────────────────────────────────────────────────────────
 function MetricRow({ metricKey, value }) {
   const cfg = METRIC_CONFIG[metricKey];
   if (!cfg || value === null || value === undefined) return null;
 
-  // For direction-based coloring we need the raw value and the "goodness" direction
-  // For ratio metrics (lower_is_better = false), negative rawMetric means cheap → green
-  // We pass the raw value; color logic lives in metricColor
   const color = metricColor(
     cfg.higher_is_better === false ? -value : value,
     cfg.higher_is_better === null ? null : true
@@ -183,17 +222,24 @@ function MetricRow({ metricKey, value }) {
       display: "flex", justifyContent: "space-between", alignItems: "center",
       padding: "7px 0", borderBottom: "1px solid #0d1829",
     }}>
-      <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, color: "#64748b" }}>
+      <span style={{
+        fontFamily: "'JetBrains Mono', monospace",
+        fontSize: 11,
+        color: "#94a3b8",   // was #64748b — bumped up for readability
+      }}>
         {cfg.label}
       </span>
-      <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color, fontWeight: 500 }}>
+      <span style={{
+        fontFamily: "'JetBrains Mono', monospace",
+        fontSize: 12, color, fontWeight: 500,
+      }}>
         {fmtValue(value, cfg.fmt)}
       </span>
     </div>
   );
 }
 
-// ─── App ─────────────────────────────────────────────────────────────────────
+// ─── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
   const [ticker,  setTicker]  = useState("");
   const [loading, setLoading] = useState(false);
@@ -243,7 +289,6 @@ export default function App() {
     }
   };
 
-  // Split rawMetrics by pillar for display
   const metricsByPillar = result ? {
     value:    ["dcf_margin_of_safety", "pe_ratio", "pb_ratio", "ev_ebitda"],
     growth:   ["revenue_cagr", "eps_trend", "fcf_trend"],
@@ -254,8 +299,8 @@ export default function App() {
     <div style={{ minHeight: "100vh", background: "#060d1a", color: "#e2e8f0", padding: "0 16px 80px" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=JetBrains+Mono:wght@300;400;500&display=swap');
-        @keyframes pulse   { 0%,100%{opacity:1} 50%{opacity:0.3} }
-        @keyframes fadeIn  { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+        @keyframes pulse  { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        @keyframes fadeIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
         * { box-sizing: border-box }
         input::placeholder { color: #334155 }
         input:focus { outline: none }
@@ -269,7 +314,7 @@ export default function App() {
         <h1 style={{ fontFamily: "'DM Serif Display',serif", fontSize: "clamp(36px,7vw,66px)", margin: 0, lineHeight: 1, fontWeight: 400 }}>
           Stock <em style={{ color: "#38bdf8" }}>Oracle</em>
         </h1>
-        <p style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 11, color: "#334155", marginTop: 10, letterSpacing: 1 }}>
+        <p style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 11, color: "#64748b", marginTop: 10, letterSpacing: 1 }}>
           DCF · Value · Growth · Momentum · Pure Quantitative
         </p>
       </div>
@@ -298,7 +343,8 @@ export default function App() {
               border: "none", cursor: loading ? "wait" : "pointer",
               color: loading || !ticker.trim() ? "#38bdf8" : "#060d1a",
               fontFamily: "'JetBrains Mono',monospace", fontSize: 11, letterSpacing: 2, fontWeight: 500,
-              transition: "all 0.2s", flexShrink: 0, opacity: !ticker.trim() && !loading ? 0.4 : 1,
+              transition: "all 0.2s", flexShrink: 0,
+              opacity: !ticker.trim() && !loading ? 0.4 : 1,
             }}
           >
             {loading ? "ANALYZING…" : "ANALYZE →"}
@@ -309,7 +355,7 @@ export default function App() {
       {/* Loading */}
       {loading && (
         <div style={{ maxWidth: 380, margin: "0 auto", background: "#0d1829", border: "1px solid #1e3a5f", borderRadius: 3, padding: "22px 26px", animation: "fadeIn 0.3s ease" }}>
-          <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 10, letterSpacing: 4, color: "#38bdf8", marginBottom: 14 }}>RUNNING ANALYSIS</div>
+          <SectionLabel>RUNNING ANALYSIS</SectionLabel>
           <StepList currentStep={step} done={false} />
         </div>
       )}
@@ -337,14 +383,14 @@ export default function App() {
             </div>
 
             <div style={{ textAlign: "center" }}>
-              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#334155", letterSpacing: 2 }}>PRICE</div>
+              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#7dd3fc", letterSpacing: 2, marginBottom: 4 }}>PRICE</div>
               <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 28 }}>
                 ${typeof result.currentPrice === "number" ? result.currentPrice.toLocaleString() : "—"}
               </div>
             </div>
 
             <div style={{ textAlign: "center" }}>
-              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#334155", letterSpacing: 2, marginBottom: 6 }}>VERDICT</div>
+              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#7dd3fc", letterSpacing: 2, marginBottom: 6 }}>VERDICT</div>
               <div style={{
                 fontFamily: "'JetBrains Mono',monospace", fontSize: 12, letterSpacing: 2,
                 color: verdictColor(result.verdict),
@@ -356,7 +402,7 @@ export default function App() {
             </div>
 
             <div style={{ textAlign: "center" }}>
-              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#334155", letterSpacing: 2 }}>DATA COVERAGE</div>
+              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#7dd3fc", letterSpacing: 2, marginBottom: 4 }}>DATA COVERAGE</div>
               <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 28, color: result.dataCoverage >= 0.8 ? "#4ade80" : "#facc15" }}>
                 {Math.round(result.dataCoverage * 100)}%
               </div>
@@ -366,17 +412,13 @@ export default function App() {
           {/* Main grid */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
 
-            {/* Gauge + Pillars */}
+            {/* Probability + Pillars */}
             <div style={{ background: "#0d1829", border: "1px solid #1e3a5f", borderRadius: 3, padding: "22px 26px", display: "flex", flexDirection: "column", alignItems: "center" }}>
-              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#334155", letterSpacing: 3, marginBottom: 12, alignSelf: "flex-start" }}>
-                CONFIDENCE GAUGE
-              </div>
-              <GaugeArc probability={result.buyProbability || 0} />
+              <SectionLabel style={{ alignSelf: "flex-start" }}>BUY PROBABILITY</SectionLabel>
+              <ProbabilityDisplay probability={result.buyProbability} />
 
-              <div style={{ marginTop: 20, width: "100%" }}>
-                <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#334155", letterSpacing: 3, marginBottom: 10 }}>
-                  PILLAR BREAKDOWN
-                </div>
+              <div style={{ marginTop: 8, width: "100%" }}>
+                <SectionLabel>PILLAR BREAKDOWN</SectionLabel>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
                   {result.pillars && Object.entries(result.pillars).map(([name, data]) => (
                     <PillarCard key={name} name={name} data={data} />
@@ -385,26 +427,29 @@ export default function App() {
               </div>
 
               <div style={{ marginTop: 16, width: "100%" }}>
-                <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#334155", letterSpacing: 3, marginBottom: 8 }}>
-                  COMPOSITE Z-SCORE
-                </div>
-                <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 20,
-                  color: result.compositeZ >= 0 ? "#4ade80" : "#f87171" }}>
+                <SectionLabel>COMPOSITE Z-SCORE</SectionLabel>
+                <div style={{
+                  fontFamily: "'JetBrains Mono', monospace", fontSize: 20,
+                  color: result.compositeZ >= 0 ? "#4ade80" : "#f87171",
+                }}>
                   {result.compositeZ >= 0 ? "+" : ""}{result.compositeZ?.toFixed(3)}
                 </div>
               </div>
             </div>
 
-            {/* Metrics by pillar */}
+            {/* Factor metrics */}
             <div style={{ background: "#0d1829", border: "1px solid #1e3a5f", borderRadius: 3, padding: "22px 26px" }}>
-              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#334155", letterSpacing: 3, marginBottom: 12 }}>
-                FACTOR METRICS
-              </div>
+              <SectionLabel>FACTOR METRICS</SectionLabel>
 
               {metricsByPillar && Object.entries(metricsByPillar).map(([pillar, keys]) => (
                 <div key={pillar} style={{ marginBottom: 18 }}>
-                  <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, letterSpacing: 3,
-                    color: "#1e3a5f", marginBottom: 6 }}>
+                  {/* Pillar sub-header */}
+                  <div style={{
+                    fontFamily: "'JetBrains Mono', monospace",
+                    fontSize: 9, letterSpacing: 3,
+                    color: "#475569",   // was #1e3a5f — now visible
+                    marginBottom: 6,
+                  }}>
                     — {PILLAR_LABELS[pillar]}
                   </div>
                   {keys.map(k => (
@@ -414,16 +459,14 @@ export default function App() {
               ))}
             </div>
 
-            {/* Analysis steps (full width) */}
+            {/* Analysis steps — full width */}
             <div style={{ background: "#0d1829", border: "1px solid #1e3a5f", borderRadius: 3, padding: "22px 26px", gridColumn: "1 / -1" }}>
-              <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#334155", letterSpacing: 3, marginBottom: 10 }}>
-                ANALYSIS STEPS
-              </div>
+              <SectionLabel>ANALYSIS STEPS</SectionLabel>
               <StepList currentStep={-1} done={true} />
             </div>
           </div>
 
-          <div style={{ textAlign: "center", marginTop: 20, fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#1e293b", letterSpacing: 1 }}>
+          <div style={{ textAlign: "center", marginTop: 20, fontFamily: "'JetBrains Mono',monospace", fontSize: 9, color: "#334155", letterSpacing: 1 }}>
             NOT FINANCIAL ADVICE — EDUCATIONAL PURPOSES ONLY
           </div>
         </div>
