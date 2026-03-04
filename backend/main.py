@@ -1,344 +1,517 @@
 """
-Stock Oracle — FastAPI Backend
---------------------------------
-- Uses Yahoo Finance (yfinance) for free financial data
-- Computes DCF, buy probability, and upside %
-- Generates structured qualitative reasoning
-- No API keys required
+Stock Oracle — Pure Quantitative Multi-Factor Engine
+-----------------------------------------------------
+Three-pillar model, all signals derived from Yahoo Finance data.
 
-Run with:
-uvicorn main:app --reload --port 8000
+Pillars
+-------
+  Value    (35%)  — DCF margin of safety, trailing P/E, P/B, EV/EBITDA
+  Growth   (35%)  — Revenue CAGR, EPS trend (OLS), FCF trend (OLS)
+  Momentum (30%)  — 52-week percentile, price vs 50/200-day MA, RSI-14
+
+Scoring pipeline
+----------------
+  Each metric  →  z-score against calibrated population distributions
+  Pillar score =  mean z-score of available metrics in that pillar
+  Composite z  =  weighted mean of available pillar scores
+                  (weights redistributed proportionally when a pillar
+                   has no data at all)
+  Probability  =  logistic(composite_z, k=0.8)
+
+Missing data
+------------
+  Any metric that cannot be computed is dropped silently.
+  Its weight is redistributed to the remaining metrics/pillars.
+  A data_coverage field (0–1) is returned so the caller knows how
+  complete the analysis is.
 """
 
 import math
+import logging
+import re
+
+import numpy as np
 import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ── App Setup ───────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Stock Oracle API")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+)
+log = logging.getLogger("stock_oracle")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# App
+# ─────────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Stock Oracle — Quantitative Engine")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Request Model ───────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
     ticker: str
 
 
-# ── Utility Functions ───────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Population distribution parameters
+# ─────────────────────────────────────────────────────────────────────────────
+# mu/sigma approximate the cross-sectional distribution of each metric across
+# large-cap US equities.  They convert raw values into z-scores on a common
+# scale.  For "lower is better" metrics the z-score is negated so that
+# higher z always means "more attractive".
 
-def safe(value, fallback=None):
-    if value is None:
-        return fallback
+DISTRIBUTIONS: dict[str, dict] = {
+    # ── Value ────────────────────────────────────────────────────────────────
+    # (intrinsic_price - current_price) / current_price  →  positive = cheap
+    "dcf_margin_of_safety": {"mu":  0.00, "sigma": 0.40, "higher_is_better": True},
+    # Trailing twelve-month P/E                          →  lower = cheaper
+    "pe_ratio":             {"mu": 22.00, "sigma": 12.0, "higher_is_better": False},
+    # Price-to-book                                      →  lower = cheaper
+    "pb_ratio":             {"mu":  3.50, "sigma":  3.0, "higher_is_better": False},
+    # Enterprise Value / EBITDA                          →  lower = cheaper
+    "ev_ebitda":            {"mu": 14.00, "sigma":  8.0, "higher_is_better": False},
+
+    # ── Growth ───────────────────────────────────────────────────────────────
+    # Annualised revenue CAGR over available annual periods
+    "revenue_cagr":         {"mu":  0.06, "sigma": 0.12, "higher_is_better": True},
+    # OLS slope of EPS series / |mean EPS|  (normalised trend)
+    "eps_trend":            {"mu":  0.05, "sigma": 0.20, "higher_is_better": True},
+    # OLS slope of FCF series / |mean FCF|  (normalised trend)
+    "fcf_trend":            {"mu":  0.05, "sigma": 0.20, "higher_is_better": True},
+
+    # ── Momentum ─────────────────────────────────────────────────────────────
+    # Position within 52-week range: 0 = at 52-wk low, 1 = at 52-wk high
+    "week52_percentile":    {"mu":  0.50, "sigma": 0.25, "higher_is_better": True},
+    # (price / 50-day MA) - 1
+    "price_vs_ma50":        {"mu":  0.00, "sigma": 0.08, "higher_is_better": True},
+    # (price / 200-day MA) - 1
+    "price_vs_ma200":       {"mu":  0.00, "sigma": 0.15, "higher_is_better": True},
+    # RSI-14 centred at 50; above 50 = bullish momentum
+    "rsi14":                {"mu": 50.00, "sigma": 12.0, "higher_is_better": True},
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pillar membership & base weights
+# ─────────────────────────────────────────────────────────────────────────────
+
+PILLARS: dict[str, dict] = {
+    "value": {
+        "metrics": ["dcf_margin_of_safety", "pe_ratio", "pb_ratio", "ev_ebitda"],
+        "weight":  0.35,
+    },
+    "growth": {
+        "metrics": ["revenue_cagr", "eps_trend", "fcf_trend"],
+        "weight":  0.35,
+    },
+    "momentum": {
+        "metrics": ["week52_percentile", "price_vs_ma50", "price_vs_ma200", "rsi14"],
+        "weight":  0.30,
+    },
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def safe_float(x) -> float | None:
+    """Return float or None; never raises."""
     try:
-        if not math.isfinite(float(value)):
-            return fallback
-    except (TypeError, ValueError):
-        return fallback
-    return value
-
-
-def pct(value):
-    v = safe(value)
-    return round(v * 100, 1) if v is not None else None
-
-
-def cagr(start, end, years):
-    if not start or not end or years <= 0 or start <= 0:
+        if x is None:
+            return None
+        v = float(x)
+        return v if math.isfinite(v) else None
+    except Exception:
         return None
-    return round(((end / start) ** (1 / years) - 1) * 100, 1)
 
 
-# ── DCF Engine ──────────────────────────────────────────────
-
-def compute_dcf(
-    fcf_per_share: float,
-    fcf_cagr_pct: float,
-    wacc_pct: float = 9.0,
-    terminal_growth_pct: float = 3.0,
-    years: int = 5,
-):
-    wacc = wacc_pct / 100
-    g = terminal_growth_pct / 100
-    fcf_cagr = fcf_cagr_pct / 100
-
-    pv = 0.0
-    fcf = fcf_per_share
-
-    for t in range(1, years + 1):
-        fcf *= (1 + fcf_cagr)
-        pv += fcf / (1 + wacc) ** t
-
-    if wacc <= g:
-        terminal_value = 0
-    else:
-        terminal_value = (fcf * (1 + g)) / (wacc - g)
-
-    pv += terminal_value / (1 + wacc) ** years
-
-    return round(pv, 2)
+def z_score(metric: str, value: float) -> float:
+    """
+    Z-score a raw metric value using the population parameters defined in
+    DISTRIBUTIONS.  The sign is flipped for 'lower is better' metrics so that
+    a higher z always means 'more attractive'.
+    """
+    d = DISTRIBUTIONS[metric]
+    z = (value - d["mu"]) / d["sigma"]
+    return z if d["higher_is_better"] else -z
 
 
-# ── Scoring System ──────────────────────────────────────────
-
-def score_buy_probability(metrics: dict, dcf_upside: float) -> float:
-    score = 0.5
-
-    # DCF weight
-    if dcf_upside > 20:
-        score += 0.25
-    elif dcf_upside > 5:
-        score += 0.12
-    elif dcf_upside < -20:
-        score -= 0.25
-    elif dcf_upside < -5:
-        score -= 0.12
-
-    # Growth
-    if metrics.get("revenueCAGR") and metrics["revenueCAGR"] > 10:
-        score += 0.05
-
-    if metrics.get("epsGrowth") and metrics["epsGrowth"] > 10:
-        score += 0.05
-
-    # Profitability
-    if metrics.get("roe") and metrics["roe"] > 15:
-        score += 0.05
-
-    # Valuation sanity
-    if metrics.get("pe") and metrics["pe"] < 25:
-        score += 0.05
-
-    return round(max(0.0, min(1.0, score)), 2)
+def ols_normalised_slope(series: list[float]) -> float | None:
+    """
+    Fit OLS to (t=0,1,…,n-1) vs y and return slope / |mean(y)|.
+    Requires ≥ 3 points and a non-zero mean.  Returns None otherwise.
+    The normalisation makes the slope comparable across stocks of different
+    sizes (analogous to a percentage growth rate per period).
+    """
+    if len(series) < 3:
+        return None
+    mean_y = float(np.mean(series))
+    if abs(mean_y) < 1e-9:
+        return None
+    x = np.arange(len(series), dtype=float)
+    x_c = x - x.mean()
+    y_c = np.array(series) - mean_y
+    slope = float(np.dot(x_c, y_c) / np.dot(x_c, x_c))
+    return slope / abs(mean_y)
 
 
-def verdict_from_score(probability: float, dcf_upside: float) -> str:
-    if probability >= 0.70 and dcf_upside > 10:
+def logistic(z: float, k: float = 0.8) -> float:
+    """Sigmoid mapping composite z → (0, 1)."""
+    return round(1.0 / (1.0 + math.exp(-k * z)), 4)
+
+
+def verdict(p: float) -> str:
+    if p >= 0.72:
         return "STRONG BUY"
-    elif probability >= 0.55:
-        return "MODERATE BUY"
-    elif probability >= 0.42:
+    if p >= 0.60:
+        return "BUY"
+    if p >= 0.45:
         return "HOLD"
-    elif probability >= 0.30:
-        return "MODERATE SELL"
-    else:
-        return "STRONG SELL"
+    if p >= 0.33:
+        return "SELL"
+    return "STRONG SELL"
 
 
-# ── Qualitative Generator ───────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Metric computers — Value
+# ─────────────────────────────────────────────────────────────────────────────
 
-def generate_qualitative(dcf_upside, pe):
-    if dcf_upside > 15:
-        mispricing = "DCF suggests the stock may be undervalued relative to intrinsic cash flow projections."
-    elif dcf_upside < -15:
-        mispricing = "DCF suggests the stock may be overvalued relative to projected cash flows."
-    else:
-        mispricing = "DCF indicates the stock is trading near intrinsic value."
+def _dcf_margin_of_safety(info: dict, financials, cashflow) -> float | None:
+    """
+    WACC-based 5-year DCF.
+    Returns (intrinsic_price - current_price) / current_price.
+    Positive → model says undervalued; negative → model says overvalued.
 
-    if pe and pe > 30:
-        valuation = "The stock trades at a relatively high earnings multiple."
-    elif pe and pe < 15:
-        valuation = "The stock trades at a relatively low earnings multiple."
-    else:
-        valuation = "Valuation appears broadly in line with typical market ranges."
+    FCF growth is estimated via OLS normalised slope over all available annual
+    periods (more stable than a single year-over-year delta).
+    """
+    try:
+        beta       = safe_float(info.get("beta")) or 1.0
+        mkt_cap    = safe_float(info.get("marketCap"))
+        total_debt = safe_float(info.get("totalDebt")) or 0.0
+        cash       = safe_float(info.get("totalCash")) or 0.0
+        shares     = safe_float(info.get("sharesOutstanding"))
+        price      = safe_float(info.get("currentPrice"))
 
+        if not all([mkt_cap, shares, price]):
+            return None
+
+        # WACC
+        rf, erp, tax = 0.045, 0.055, 0.21
+        ke = rf + beta * erp
+
+        try:
+            int_exp   = abs(float(financials.loc["Interest Expense"].iloc[0]))
+            kd        = int_exp / total_debt if total_debt > 0 else 0.04
+        except Exception:
+            kd = 0.04
+
+        total_cap = mkt_cap + total_debt
+        wacc      = (mkt_cap / total_cap) * ke + (total_debt / total_cap) * kd * (1 - tax)
+
+        # FCF series — yfinance returns most-recent first; reverse → chronological
+        try:
+            fcf_vals = cashflow.loc["Free Cash Flow"].dropna().tolist()
+            fcf_vals = list(reversed(fcf_vals))
+        except Exception:
+            return None
+
+        if len(fcf_vals) < 2:
+            return None
+
+        # Growth estimate
+        slope = ols_normalised_slope(fcf_vals)
+        if slope is None:
+            # Fallback: two-point CAGR (requires positive endpoints)
+            if fcf_vals[0] > 0 and fcf_vals[-1] > 0:
+                n     = len(fcf_vals) - 1
+                slope = (fcf_vals[-1] / fcf_vals[0]) ** (1 / n) - 1
+            else:
+                return None
+
+        growth = max(min(float(slope), 0.20), -0.05)
+
+        # 5-year projection
+        terminal_g = 0.025
+        if wacc <= terminal_g:
+            return None
+
+        fcf_latest = fcf_vals[-1]
+        projected  = [fcf_latest * (1 + growth) ** t for t in range(1, 6)]
+        pv_fcfs    = sum(cf / (1 + wacc) ** t for t, cf in enumerate(projected, 1))
+
+        tv         = projected[-1] * (1 + terminal_g) / (wacc - terminal_g)
+        pv_tv      = tv / (1 + wacc) ** 5
+
+        intrinsic  = ((pv_fcfs + pv_tv) - total_debt + cash) / shares
+        return (intrinsic - price) / price
+
+    except Exception as exc:
+        log.debug("DCF error: %s", exc)
+        return None
+
+
+def _pe_ratio(info: dict) -> float | None:
+    return safe_float(info.get("trailingPE"))
+
+
+def _pb_ratio(info: dict) -> float | None:
+    return safe_float(info.get("priceToBook"))
+
+
+def _ev_ebitda(info: dict) -> float | None:
+    ev     = safe_float(info.get("enterpriseValue"))
+    ebitda = safe_float(info.get("ebitda"))
+    if ev and ebitda and ebitda != 0:
+        return ev / ebitda
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metric computers — Growth
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _revenue_cagr(financials) -> float | None:
+    """Annualised revenue CAGR across all available annual periods."""
+    try:
+        rev = financials.loc["Total Revenue"].dropna().tolist()
+        rev = list(reversed(rev))           # chronological
+        if len(rev) < 2 or rev[0] <= 0:
+            return None
+        n = len(rev) - 1
+        return (rev[-1] / rev[0]) ** (1 / n) - 1
+    except Exception as exc:
+        log.debug("Revenue CAGR error: %s", exc)
+        return None
+
+
+def _eps_trend(financials) -> float | None:
+    """OLS normalised slope of diluted EPS."""
+    try:
+        eps = financials.loc["Diluted EPS"].dropna().tolist()
+        return ols_normalised_slope(list(reversed(eps)))
+    except Exception as exc:
+        log.debug("EPS trend error: %s", exc)
+        return None
+
+
+def _fcf_trend(cashflow) -> float | None:
+    """OLS normalised slope of Free Cash Flow."""
+    try:
+        fcf = cashflow.loc["Free Cash Flow"].dropna().tolist()
+        return ols_normalised_slope(list(reversed(fcf)))
+    except Exception as exc:
+        log.debug("FCF trend error: %s", exc)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metric computers — Momentum  (requires price history fetch)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _momentum_metrics(ticker: str) -> dict[str, float | None]:
+    """
+    Fetches 1 year of daily closes to compute:
+      week52_percentile — where price sits in the 52-week range
+      price_vs_ma50     — (price / 50-day MA) - 1
+      price_vs_ma200    — (price / 200-day MA) - 1
+      rsi14             — Wilder RSI with a 14-period lookback
+    """
+    out: dict[str, float | None] = {
+        "week52_percentile": None,
+        "price_vs_ma50":     None,
+        "price_vs_ma200":    None,
+        "rsi14":             None,
+    }
+
+    try:
+        hist   = yf.Ticker(ticker).history(period="1y")
+        if hist.empty or len(hist) < 15:
+            return out
+
+        closes = hist["Close"].dropna()
+        price  = float(closes.iloc[-1])
+
+        # 52-week percentile
+        lo, hi = float(closes.min()), float(closes.max())
+        if hi > lo:
+            out["week52_percentile"] = (price - lo) / (hi - lo)
+
+        # Moving averages
+        if len(closes) >= 50:
+            out["price_vs_ma50"]  = price / float(closes.iloc[-50:].mean()) - 1
+        if len(closes) >= 200:
+            out["price_vs_ma200"] = price / float(closes.iloc[-200:].mean()) - 1
+
+        # RSI-14 (simple rolling average, not Wilder EMA — sufficient for scoring)
+        if len(closes) >= 15:
+            delta    = closes.diff().dropna()
+            gains    = delta.clip(lower=0)
+            losses   = (-delta).clip(lower=0)
+            avg_gain = float(gains.iloc[-14:].mean())
+            avg_loss = float(losses.iloc[-14:].mean())
+            if avg_loss == 0:
+                out["rsi14"] = 100.0
+            else:
+                rs            = avg_gain / avg_loss
+                out["rsi14"] = 100.0 - 100.0 / (1.0 + rs)
+
+    except Exception as exc:
+        log.debug("Momentum error: %s", exc)
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aggregate metric collection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def collect_metrics(ticker: str, info: dict, financials, cashflow) -> dict[str, float | None]:
+    mom = _momentum_metrics(ticker)
     return {
-        "mispricingAnalysis": mispricing,
-        "valuationCommentary": valuation,
-        "keyRisks": [
-            "Macroeconomic slowdown",
-            "Margin compression",
-            "Competitive pressure",
-        ],
-        "keyOpportunities": [
-            "Revenue expansion",
-            "Margin improvement",
-            "Capital allocation efficiency",
-        ],
+        # Value
+        "dcf_margin_of_safety": _dcf_margin_of_safety(info, financials, cashflow),
+        "pe_ratio":             _pe_ratio(info),
+        "pb_ratio":             _pb_ratio(info),
+        "ev_ebitda":            _ev_ebitda(info),
+        # Growth
+        "revenue_cagr":         _revenue_cagr(financials),
+        "eps_trend":            _eps_trend(financials),
+        "fcf_trend":            _fcf_trend(cashflow),
+        # Momentum
+        "week52_percentile":    mom["week52_percentile"],
+        "price_vs_ma50":        mom["price_vs_ma50"],
+        "price_vs_ma200":       mom["price_vs_ma200"],
+        "rsi14":                mom["rsi14"],
     }
 
 
-# ── Main Route ───────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Scoring engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+def score(raw: dict[str, float | None]) -> tuple[float, dict, float]:
+    """
+    Convert raw metrics → z-scores → pillar scores → composite z.
+
+    Returns
+    -------
+    composite_z   : float
+    pillar_detail : dict   (transparent breakdown for the API response)
+    data_coverage : float  (fraction of metrics successfully computed)
+    """
+
+    # Step 1 — z-score every available metric
+    zs: dict[str, float] = {
+        m: z_score(m, v) for m, v in raw.items() if v is not None
+    }
+
+    data_coverage = len(zs) / len(raw) if raw else 0.0
+
+    # Step 2 — pillar scores (mean z of available metrics)
+    pillar_z:      dict[str, float | None] = {}
+    pillar_weight: dict[str, float]        = {}
+
+    for name, cfg in PILLARS.items():
+        available = [zs[m] for m in cfg["metrics"] if m in zs]
+        if available:
+            pillar_z[name]      = float(np.mean(available))
+            pillar_weight[name] = cfg["weight"]
+        else:
+            pillar_z[name]      = None
+            pillar_weight[name] = 0.0
+
+    # Step 3 — redistribute weight from empty pillars
+    active_weight = sum(w for p, w in pillar_weight.items() if pillar_z[p] is not None)
+    eff_weight: dict[str, float] = {
+        p: (pillar_weight[p] / active_weight if active_weight > 0 and pillar_z[p] is not None else 0.0)
+        for p in PILLARS
+    }
+
+    # Step 4 — composite z
+    composite_z = sum(
+        eff_weight[p] * pillar_z[p]
+        for p in PILLARS
+        if pillar_z[p] is not None
+    )
+
+    # Build transparent pillar breakdown for the response
+    pillar_detail = {
+        p: {
+            "z_score":         round(pillar_z[p], 4) if pillar_z[p] is not None else None,
+            "effective_weight": round(eff_weight[p], 4),
+            "metrics_used":    [m for m in PILLARS[p]["metrics"] if m in zs],
+            "metrics_missing": [m for m in PILLARS[p]["metrics"] if m not in zs],
+        }
+        for p in PILLARS
+    }
+
+    return composite_z, pillar_detail, data_coverage
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Input validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TICKER_RE = re.compile(r"^[A-Z0-9.\-]{1,10}$")
+
+def _validate_ticker(raw: str) -> str:
+    t = raw.strip().upper()
+    if not _TICKER_RE.match(t):
+        raise HTTPException(status_code=400, detail=f"Invalid ticker: '{raw}'")
+    return t
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
+    ticker = _validate_ticker(req.ticker)
+    log.info("Analyzing %s", ticker)
 
-    ticker = req.ticker.strip().upper()
-    if not ticker:
-        raise HTTPException(status_code=400, detail="Ticker is required")
+    stock      = yf.Ticker(ticker)
+    info       = stock.info
+    financials = stock.financials
+    cashflow   = stock.cashflow
 
-    try:
-        stock = yf.Ticker(ticker)
+    # Minimal sanity check — yfinance returns an empty dict for unknown tickers
+    if not info or not (info.get("currentPrice") or info.get("regularMarketPrice")):
+        raise HTTPException(status_code=404, detail=f"No price data found for '{ticker}'")
 
-        info = stock.info
-        financials = stock.financials
-        cashflow = stock.cashflow
+    raw_metrics             = collect_metrics(ticker, info, financials, cashflow)
+    composite_z, pillars, coverage = score(raw_metrics)
+    prob                    = logistic(composite_z)
 
-        if not info:
-            raise HTTPException(status_code=404, detail="Ticker not found")
+    log.info(
+        "%s | z=%.3f | p=%.3f | %s | coverage=%.0f%%",
+        ticker, composite_z, prob, verdict(prob), coverage * 100,
+    )
 
-        current_price = safe(info.get("currentPrice"))
-        shares_outstanding = safe(info.get("sharesOutstanding"))
-        company_name = info.get("longName", ticker)
-        sector = info.get("sector", "Unknown")
+    return {
+        "ticker":         ticker,
+        "companyName":    info.get("longName", ticker),
+        "currentPrice":   safe_float(info.get("currentPrice")),
+        "buyProbability": prob,
+        "verdict":        verdict(prob),
+        "compositeZ":     round(composite_z, 4),
+        "dataCoverage":   round(coverage, 4),
+        "pillars":        pillars,
+        "rawMetrics":     {k: (round(v, 6) if v is not None else None) for k, v in raw_metrics.items()},
+    }
 
-        # Valuation
-        pe = safe(info.get("trailingPE"))
-        ps = safe(info.get("priceToSalesTrailing12Months"))
-        peg = safe(info.get("pegRatio"))
-        ev = safe(info.get("enterpriseValue"))
-        ebitda = safe(info.get("ebitda"))
-        ev_ebitda = round(ev / ebitda, 2) if ev and ebitda else None
-
-        # Margins
-        gross_margin = pct(info.get("grossMargins"))
-        operating_margin = pct(info.get("operatingMargins"))
-        net_margin = pct(info.get("profitMargins"))
-        roe = pct(info.get("returnOnEquity"))
-
-        # Revenue CAGR
-        revenue_cagr = None
-        try:
-            revenues = financials.loc["Total Revenue"].dropna()
-            if len(revenues) >= 4:
-                revenue_cagr = cagr(revenues.iloc[3], revenues.iloc[0], 3)
-        except:
-            pass
-
-        # EPS Growth
-        eps_growth = None
-        try:
-            eps = financials.loc["Diluted EPS"].dropna()
-            if len(eps) >= 2:
-                eps_growth = round(
-                    (eps.iloc[0] - eps.iloc[1]) / abs(eps.iloc[1]) * 100,
-                    1,
-                )
-        except:
-            pass
-
-        # Free Cash Flow
-        fcf_now = None
-        fcf_growth = None
-        fcf_per_share = None
-
-        try:
-            fcf_series = cashflow.loc["Free Cash Flow"].dropna()
-            if len(fcf_series) >= 4:
-                fcf_now = fcf_series.iloc[0]
-                fcf_then = fcf_series.iloc[3]
-                fcf_growth = cagr(fcf_then, fcf_now, 3)
-
-            if fcf_now and shares_outstanding:
-                fcf_per_share = fcf_now / shares_outstanding
-        except:
-            pass
-
-        # DCF
-        if fcf_per_share and fcf_growth:
-            intrinsic_value = compute_dcf(
-                fcf_per_share=fcf_per_share,
-                fcf_cagr_pct=min(max(fcf_growth, -5), 20),
-            )
-            dcf_upside = round((intrinsic_value - current_price) / current_price * 100, 1)
-        else:
-            intrinsic_value = None
-            dcf_upside = 0.0
-
-        # Score
-        flat_metrics = {
-            "pe": pe,
-            "revenueCAGR": revenue_cagr,
-            "epsGrowth": eps_growth,
-            "roe": roe,
-        }
-
-        buy_probability = score_buy_probability(flat_metrics, dcf_upside)
-        verdict = verdict_from_score(buy_probability, dcf_upside)
-
-        qualitative = generate_qualitative(dcf_upside, pe)
-
-        return {
-            "ticker": ticker,
-            "companyName": company_name,
-            "currentPrice": current_price,
-            "sector": sector,
-            "intrinsicValue": intrinsic_value,
-            "upsidePercent": dcf_upside,
-            "buyProbability": buy_probability,
-            "verdict": verdict,
-            "metrics": {
-                "pe": {
-                    "value": pe,
-                    "peerAvg": None,
-                    "direction": "neutral",
-                },
-                "ps": {
-                    "value": ps,
-                    "peerAvg": None,
-                    "direction": "neutral",
-                },
-                "peg": {
-                    "value": peg,
-                    "peerAvg": None,
-                    "direction": "neutral",
-                },
-                "evEbitda": {
-                    "value": ev_ebitda,
-                    "peerAvg": None,
-                    "direction": "neutral",
-                },
-                "revenueCAGR": {
-                    "value": revenue_cagr,
-                    "peerAvg": None,
-                    "direction": "neutral",
-                },
-                "epsGrowth": {
-                "value": eps_growth,
-                "peerAvg": None,
-                "direction": "neutral",
-                },
-                "grossMargin": {
-                    "value": gross_margin,
-                    "peerAvg": None,
-                    "direction": "neutral",
-                },
-                "operatingMargin": {
-                    "value": operating_margin,
-                    "peerAvg": None,
-                    "direction": "neutral",
-                },
-                "netMargin": {
-                    "value": net_margin,
-                    "peerAvg": None,
-                    "direction": "neutral",
-                },
-                "roe": {
-                    "value": roe,
-                    "peerAvg": None,
-                    "direction": "neutral",
-                },
-                "fcfGrowth": {
-                    "value": fcf_growth,
-                    "peerAvg": None,
-                    "direction": "neutral",
-                },
-            },
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── Health Check ─────────────────────────────────────────────
 
 @app.get("/health")
 def health():
