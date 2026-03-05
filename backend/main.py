@@ -1,13 +1,14 @@
 """
 Stock Oracle — Pure Quantitative Multi-Factor Engine
 -----------------------------------------------------
-Three-pillar model, all signals derived from Yahoo Finance data.
+Four-pillar model, all signals derived from Yahoo Finance data.
 
 Pillars
 -------
-  Value    (35%)  — DCF margin of safety, trailing P/E, P/B, EV/EBITDA
-  Growth   (35%)  — Revenue CAGR, EPS trend (OLS), FCF trend (OLS)
-  Momentum (30%)  — 52-week percentile, price vs 50/200-day MA, RSI-14
+  Value         (35%)  — DCF margin of safety, trailing P/E, P/B, EV/EBITDA
+  Growth        (35%)  — Revenue CAGR, EPS trend (OLS), FCF trend (OLS)
+  Profitability (20%)  — ROE, ROIC, gross margin, operating margin
+  Momentum      (10%)  — 52-week percentile, price vs 50/200-day MA, RSI-14
 
 Scoring pipeline
 ----------------
@@ -18,11 +19,18 @@ Scoring pipeline
                    has no data at all)
   Probability  =  logistic(composite_z, k=0.8)
 
+DCF specifics
+-------------
+  - Growth rate: FCF CAGR over all available annual periods (not OLS slope)
+  - Debt/cash:   pulled from balance sheet first, info dict as fallback
+  - MA-200:      fetches 2 years of history to guarantee 200 data points
+  - OLS slope:   used only for the growth pillar z-scores, not DCF inputs
+
 Missing data
 ------------
   Any metric that cannot be computed is dropped silently.
   Its weight is redistributed to the remaining metrics/pillars.
-  A data_coverage field (0–1) is returned so the caller knows how
+  A data_coverage field (0-1) is returned so the caller knows how
   complete the analysis is.
 """
 
@@ -68,37 +76,36 @@ class AnalyzeRequest(BaseModel):
 # Population distribution parameters
 # ─────────────────────────────────────────────────────────────────────────────
 # mu/sigma approximate the cross-sectional distribution of each metric across
-# large-cap US equities.  They convert raw values into z-scores on a common
-# scale.  For "lower is better" metrics the z-score is negated so that
+# large-cap US equities. They convert raw values into z-scores on a common
+# scale. For "lower is better" metrics the z-score is negated so that
 # higher z always means "more attractive".
 
 DISTRIBUTIONS: dict[str, dict] = {
-    # ── Value ────────────────────────────────────────────────────────────────
-    # (intrinsic_price - current_price) / current_price  →  positive = cheap
+    # ── Value ─────────────────────────────────────────────────────────────────
     "dcf_margin_of_safety": {"mu":  0.00, "sigma": 0.40, "higher_is_better": True},
-    # Trailing twelve-month P/E                          →  lower = cheaper
     "pe_ratio":             {"mu": 22.00, "sigma": 12.0, "higher_is_better": False},
-    # Price-to-book                                      →  lower = cheaper
     "pb_ratio":             {"mu":  3.50, "sigma":  3.0, "higher_is_better": False},
-    # Enterprise Value / EBITDA                          →  lower = cheaper
     "ev_ebitda":            {"mu": 14.00, "sigma":  8.0, "higher_is_better": False},
 
-    # ── Growth ───────────────────────────────────────────────────────────────
-    # Annualised revenue CAGR over available annual periods
+    # ── Growth ────────────────────────────────────────────────────────────────
     "revenue_cagr":         {"mu":  0.06, "sigma": 0.12, "higher_is_better": True},
-    # OLS slope of EPS series / |mean EPS|  (normalised trend)
     "eps_trend":            {"mu":  0.05, "sigma": 0.20, "higher_is_better": True},
-    # OLS slope of FCF series / |mean FCF|  (normalised trend)
     "fcf_trend":            {"mu":  0.05, "sigma": 0.20, "higher_is_better": True},
 
-    # ── Momentum ─────────────────────────────────────────────────────────────
-    # Position within 52-week range: 0 = at 52-wk low, 1 = at 52-wk high
+    # ── Profitability ─────────────────────────────────────────────────────────
+    # Return on Equity — net income / shareholders equity
+    "roe":                  {"mu":  0.15, "sigma": 0.15, "higher_is_better": True},
+    # Return on Invested Capital — NOPAT / (debt + equity)
+    "roic":                 {"mu":  0.10, "sigma": 0.10, "higher_is_better": True},
+    # Gross margin — (revenue - COGS) / revenue
+    "gross_margin":         {"mu":  0.40, "sigma": 0.20, "higher_is_better": True},
+    # Operating margin — operating income / revenue
+    "operating_margin":     {"mu":  0.12, "sigma": 0.12, "higher_is_better": True},
+
+    # ── Momentum ──────────────────────────────────────────────────────────────
     "week52_percentile":    {"mu":  0.50, "sigma": 0.25, "higher_is_better": True},
-    # (price / 50-day MA) - 1
     "price_vs_ma50":        {"mu":  0.00, "sigma": 0.08, "higher_is_better": True},
-    # (price / 200-day MA) - 1
     "price_vs_ma200":       {"mu":  0.00, "sigma": 0.15, "higher_is_better": True},
-    # RSI-14 centred at 50; above 50 = bullish momentum
     "rsi14":                {"mu": 50.00, "sigma": 12.0, "higher_is_better": True},
 }
 
@@ -115,9 +122,13 @@ PILLARS: dict[str, dict] = {
         "metrics": ["revenue_cagr", "eps_trend", "fcf_trend"],
         "weight":  0.35,
     },
+    "profitability": {
+        "metrics": ["roe", "roic", "gross_margin", "operating_margin"],
+        "weight":  0.20,
+    },
     "momentum": {
         "metrics": ["week52_percentile", "price_vs_ma50", "price_vs_ma200", "rsi14"],
-        "weight":  0.30,
+        "weight":  0.10,
     },
 }
 
@@ -138,9 +149,9 @@ def safe_float(x) -> float | None:
 
 def z_score(metric: str, value: float) -> float:
     """
-    Z-score a raw metric value using the population parameters defined in
-    DISTRIBUTIONS.  The sign is flipped for 'lower is better' metrics so that
-    a higher z always means 'more attractive'.
+    Z-score a raw metric value using the population parameters in DISTRIBUTIONS.
+    Sign is flipped for 'lower is better' metrics so higher z always means
+    'more attractive'.
     """
     d = DISTRIBUTIONS[metric]
     z = (value - d["mu"]) / d["sigma"]
@@ -149,25 +160,39 @@ def z_score(metric: str, value: float) -> float:
 
 def ols_normalised_slope(series: list[float]) -> float | None:
     """
-    Fit OLS to (t=0,1,…,n-1) vs y and return slope / |mean(y)|.
-    Requires ≥ 3 points and a non-zero mean.  Returns None otherwise.
-    The normalisation makes the slope comparable across stocks of different
-    sizes (analogous to a percentage growth rate per period).
+    Fit OLS to (t=0,1,...,n-1) vs y and return slope / |mean(y)|.
+    Requires >= 3 points and a non-zero mean. Returns None otherwise.
+    Used only for growth pillar z-scores, NOT as a DCF growth rate input.
     """
     if len(series) < 3:
         return None
     mean_y = float(np.mean(series))
     if abs(mean_y) < 1e-9:
         return None
-    x = np.arange(len(series), dtype=float)
+    x   = np.arange(len(series), dtype=float)
     x_c = x - x.mean()
-    y_c = np.array(series) - mean_y
+    y_c = np.array(series, dtype=float) - mean_y
     slope = float(np.dot(x_c, y_c) / np.dot(x_c, x_c))
     return slope / abs(mean_y)
 
 
+def fcf_cagr(fcf_vals: list[float]) -> float | None:
+    """
+    Compound annual growth rate of FCF across all available annual periods.
+    Requires at least 2 data points and positive values at both endpoints.
+    Used exclusively as the DCF growth input — not for z-scoring.
+    """
+    if len(fcf_vals) < 2:
+        return None
+    start, end = fcf_vals[0], fcf_vals[-1]
+    if start <= 0 or end <= 0:
+        return None
+    n = len(fcf_vals) - 1
+    return (end / start) ** (1.0 / n) - 1.0
+
+
 def logistic(z: float, k: float = 0.8) -> float:
-    """Sigmoid mapping composite z → (0, 1)."""
+    """Sigmoid mapping composite z -> (0, 1)."""
     return round(1.0 / (1.0 + math.exp(-k * z)), 4)
 
 
@@ -184,77 +209,144 @@ def verdict(p: float) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Balance sheet helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_debt_and_cash(balance_sheet, info: dict) -> tuple[float, float]:
+    """
+    Return (total_debt, cash) from balance sheet where possible,
+    falling back to the info dict to avoid date-mismatch issues.
+    """
+    total_debt = None
+    cash       = None
+
+    # Debt — try explicit row first, then reconstruct from components
+    for label in (
+        "Total Debt",
+        "Long Term Debt And Capital Lease Obligation",
+        "Long Term Debt",
+    ):
+        try:
+            v = safe_float(balance_sheet.loc[label].iloc[0])
+            if v is not None:
+                total_debt = abs(v)
+                break
+        except Exception:
+            continue
+
+    if total_debt is None:
+        try:
+            ltd = safe_float(balance_sheet.loc["Long Term Debt"].iloc[0]) or 0.0
+            std = safe_float(balance_sheet.loc["Current Debt"].iloc[0])   or 0.0
+            total_debt = abs(ltd) + abs(std)
+        except Exception:
+            pass
+
+    if total_debt is None:
+        total_debt = safe_float(info.get("totalDebt")) or 0.0
+
+    # Cash
+    for label in (
+        "Cash And Cash Equivalents",
+        "Cash Cash Equivalents And Short Term Investments",
+        "Cash And Short Term Investments",
+    ):
+        try:
+            v = safe_float(balance_sheet.loc[label].iloc[0])
+            if v is not None:
+                cash = v
+                break
+        except Exception:
+            continue
+
+    if cash is None:
+        cash = safe_float(info.get("totalCash")) or 0.0
+
+    return float(total_debt), float(cash)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Metric computers — Value
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _dcf_margin_of_safety(info: dict, financials, cashflow) -> float | None:
+def _dcf_margin_of_safety(
+    info: dict,
+    financials,
+    cashflow,
+    balance_sheet,
+) -> float | None:
     """
     WACC-based 5-year DCF.
     Returns (intrinsic_price - current_price) / current_price.
-    Positive → model says undervalued; negative → model says overvalued.
+    Positive = undervalued vs model; negative = overvalued vs model.
 
-    FCF growth is estimated via OLS normalised slope over all available annual
-    periods (more stable than a single year-over-year delta).
+    Growth rate  : FCF CAGR (not OLS slope — CAGR is correct for compounding)
+    Debt / cash  : balance sheet sourced to ensure same reporting date
+    Terminal g   : 2.5%
+    Growth cap   : [-5%, +20%]
     """
     try:
-        beta       = safe_float(info.get("beta")) or 1.0
-        mkt_cap    = safe_float(info.get("marketCap"))
-        total_debt = safe_float(info.get("totalDebt")) or 0.0
-        cash       = safe_float(info.get("totalCash")) or 0.0
-        shares     = safe_float(info.get("sharesOutstanding"))
-        price      = safe_float(info.get("currentPrice"))
+        beta    = safe_float(info.get("beta")) or 1.0
+        mkt_cap = safe_float(info.get("marketCap"))
+        shares  = safe_float(info.get("sharesOutstanding"))
+        price   = safe_float(info.get("currentPrice"))
 
         if not all([mkt_cap, shares, price]):
             return None
+
+        total_debt, cash = _get_debt_and_cash(balance_sheet, info)
 
         # WACC
         rf, erp, tax = 0.045, 0.055, 0.21
         ke = rf + beta * erp
 
         try:
-            int_exp   = abs(float(financials.loc["Interest Expense"].iloc[0]))
-            kd        = int_exp / total_debt if total_debt > 0 else 0.04
+            int_exp = safe_float(financials.loc["Interest Expense"].iloc[0])
+            kd = abs(int_exp) / total_debt if (int_exp and total_debt > 0) else 0.04
         except Exception:
             kd = 0.04
 
+        kd        = max(0.005, min(kd, 0.15))
         total_cap = mkt_cap + total_debt
-        wacc      = (mkt_cap / total_cap) * ke + (total_debt / total_cap) * kd * (1 - tax)
+        wacc      = (
+            (mkt_cap    / total_cap) * ke
+            + (total_debt / total_cap) * kd * (1.0 - tax)
+        )
 
         # FCF series — yfinance returns most-recent first; reverse → chronological
         try:
-            fcf_vals = cashflow.loc["Free Cash Flow"].dropna().tolist()
-            fcf_vals = list(reversed(fcf_vals))
+            fcf_vals = list(reversed(cashflow.loc["Free Cash Flow"].dropna().tolist()))
         except Exception:
             return None
 
         if len(fcf_vals) < 2:
             return None
 
-        # Growth estimate
-        slope = ols_normalised_slope(fcf_vals)
-        if slope is None:
-            # Fallback: two-point CAGR (requires positive endpoints)
-            if fcf_vals[0] > 0 and fcf_vals[-1] > 0:
-                n     = len(fcf_vals) - 1
-                slope = (fcf_vals[-1] / fcf_vals[0]) ** (1 / n) - 1
-            else:
+        # Growth: CAGR preferred; median YoY as fallback when endpoints are negative
+        growth = fcf_cagr(fcf_vals)
+        if growth is None:
+            yoy = [
+                (fcf_vals[i] - fcf_vals[i - 1]) / fcf_vals[i - 1]
+                for i in range(1, len(fcf_vals))
+                if fcf_vals[i - 1] > 0
+            ]
+            if not yoy:
                 return None
+            growth = float(np.median(yoy))
 
-        growth = max(min(float(slope), 0.20), -0.05)
-
-        # 5-year projection
+        growth     = max(-0.05, min(growth, 0.20))
         terminal_g = 0.025
+
         if wacc <= terminal_g:
             return None
 
-        fcf_latest = fcf_vals[-1]
-        projected  = [fcf_latest * (1 + growth) ** t for t in range(1, 6)]
-        pv_fcfs    = sum(cf / (1 + wacc) ** t for t, cf in enumerate(projected, 1))
+        fcf_base  = fcf_vals[-1]
+        projected = [fcf_base * (1.0 + growth) ** t for t in range(1, 6)]
+        pv_fcfs   = sum(cf / (1.0 + wacc) ** t for t, cf in enumerate(projected, 1))
+        tv        = projected[-1] * (1.0 + terminal_g) / (wacc - terminal_g)
+        pv_tv     = tv / (1.0 + wacc) ** 5
 
-        tv         = projected[-1] * (1 + terminal_g) / (wacc - terminal_g)
-        pv_tv      = tv / (1 + wacc) ** 5
-
-        intrinsic  = ((pv_fcfs + pv_tv) - total_debt + cash) / shares
+        intrinsic = ((pv_fcfs + pv_tv) - total_debt + cash) / shares
         return (intrinsic - price) / price
 
     except Exception as exc:
@@ -263,17 +355,19 @@ def _dcf_margin_of_safety(info: dict, financials, cashflow) -> float | None:
 
 
 def _pe_ratio(info: dict) -> float | None:
-    return safe_float(info.get("trailingPE"))
+    v = safe_float(info.get("trailingPE"))
+    return v if v and v > 0 else None
 
 
 def _pb_ratio(info: dict) -> float | None:
-    return safe_float(info.get("priceToBook"))
+    v = safe_float(info.get("priceToBook"))
+    return v if v and v > 0 else None
 
 
 def _ev_ebitda(info: dict) -> float | None:
     ev     = safe_float(info.get("enterpriseValue"))
     ebitda = safe_float(info.get("ebitda"))
-    if ev and ebitda and ebitda != 0:
+    if ev and ebitda and ebitda > 0:
         return ev / ebitda
     return None
 
@@ -283,50 +377,83 @@ def _ev_ebitda(info: dict) -> float | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _revenue_cagr(financials) -> float | None:
-    """Annualised revenue CAGR across all available annual periods."""
     try:
-        rev = financials.loc["Total Revenue"].dropna().tolist()
-        rev = list(reversed(rev))           # chronological
-        if len(rev) < 2 or rev[0] <= 0:
+        rev = list(reversed(financials.loc["Total Revenue"].dropna().tolist()))
+        if len(rev) < 2 or rev[0] <= 0 or rev[-1] <= 0:
             return None
         n = len(rev) - 1
-        return (rev[-1] / rev[0]) ** (1 / n) - 1
+        return (rev[-1] / rev[0]) ** (1.0 / n) - 1.0
     except Exception as exc:
         log.debug("Revenue CAGR error: %s", exc)
         return None
 
 
 def _eps_trend(financials) -> float | None:
-    """OLS normalised slope of diluted EPS."""
     try:
-        eps = financials.loc["Diluted EPS"].dropna().tolist()
-        return ols_normalised_slope(list(reversed(eps)))
+        eps = list(reversed(financials.loc["Diluted EPS"].dropna().tolist()))
+        return ols_normalised_slope(eps)
     except Exception as exc:
         log.debug("EPS trend error: %s", exc)
         return None
 
 
 def _fcf_trend(cashflow) -> float | None:
-    """OLS normalised slope of Free Cash Flow."""
     try:
-        fcf = cashflow.loc["Free Cash Flow"].dropna().tolist()
-        return ols_normalised_slope(list(reversed(fcf)))
+        fcf = list(reversed(cashflow.loc["Free Cash Flow"].dropna().tolist()))
+        return ols_normalised_slope(fcf)
     except Exception as exc:
         log.debug("FCF trend error: %s", exc)
         return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metric computers — Momentum  (requires price history fetch)
+# Metric computers — Profitability
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _roe(info: dict) -> float | None:
+    """
+    Return on Equity = net income / shareholders equity.
+    yfinance provides this directly as returnOnEquity (expressed as a decimal).
+    Negative ROE is dropped — it conflates two very different situations
+    (loss-making vs negative book equity) and z-scoring it as "bad" is
+    misleading.
+    """
+    v = safe_float(info.get("returnOnEquity"))
+    return v if v is not None and v > 0 else None
+
+
+def _roic(info: dict) -> float | None:
+    """
+    Return on Invested Capital = returnOnAssets used as a proxy.
+    yfinance does not expose a direct ROIC field; ROA (net income / total
+    assets) is the closest available single field and correlates strongly
+    with true ROIC for capital-light businesses.
+    Negative values dropped for the same reason as ROE.
+    """
+    v = safe_float(info.get("returnOnAssets"))
+    return v if v is not None and v > 0 else None
+
+
+def _gross_margin(info: dict) -> float | None:
+    v = safe_float(info.get("grossMargins"))
+    # Gross margin should be between 0 and 1 to be meaningful
+    return v if v is not None and 0 < v < 1 else None
+
+
+def _operating_margin(info: dict) -> float | None:
+    v = safe_float(info.get("operatingMargins"))
+    # Allow negative operating margin — it's a valid (bad) signal
+    return v if v is not None else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metric computers — Momentum
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _momentum_metrics(ticker: str) -> dict[str, float | None]:
     """
-    Fetches 1 year of daily closes to compute:
-      week52_percentile — where price sits in the 52-week range
-      price_vs_ma50     — (price / 50-day MA) - 1
-      price_vs_ma200    — (price / 200-day MA) - 1
-      rsi14             — Wilder RSI with a 14-period lookback
+    Fetches 2 years of daily closes (guarantees >= 200 points for MA-200).
+    Computes: 52-week percentile, price vs MA-50, price vs MA-200, RSI-14.
     """
     out: dict[str, float | None] = {
         "week52_percentile": None,
@@ -336,36 +463,35 @@ def _momentum_metrics(ticker: str) -> dict[str, float | None]:
     }
 
     try:
-        hist   = yf.Ticker(ticker).history(period="1y")
+        hist = yf.Ticker(ticker).history(period="2y")
         if hist.empty or len(hist) < 15:
             return out
 
         closes = hist["Close"].dropna()
         price  = float(closes.iloc[-1])
 
-        # 52-week percentile
-        lo, hi = float(closes.min()), float(closes.max())
+        # 52-week percentile — trailing 252 trading days only
+        year_closes = closes.iloc[-252:] if len(closes) >= 252 else closes
+        lo, hi = float(year_closes.min()), float(year_closes.max())
         if hi > lo:
             out["week52_percentile"] = (price - lo) / (hi - lo)
 
-        # Moving averages
         if len(closes) >= 50:
-            out["price_vs_ma50"]  = price / float(closes.iloc[-50:].mean()) - 1
+            out["price_vs_ma50"]  = price / float(closes.iloc[-50:].mean())  - 1.0
         if len(closes) >= 200:
-            out["price_vs_ma200"] = price / float(closes.iloc[-200:].mean()) - 1
+            out["price_vs_ma200"] = price / float(closes.iloc[-200:].mean()) - 1.0
 
-        # RSI-14 (simple rolling average, not Wilder EMA — sufficient for scoring)
+        # RSI-14
         if len(closes) >= 15:
             delta    = closes.diff().dropna()
             gains    = delta.clip(lower=0)
             losses   = (-delta).clip(lower=0)
             avg_gain = float(gains.iloc[-14:].mean())
             avg_loss = float(losses.iloc[-14:].mean())
-            if avg_loss == 0:
-                out["rsi14"] = 100.0
-            else:
-                rs            = avg_gain / avg_loss
-                out["rsi14"] = 100.0 - 100.0 / (1.0 + rs)
+            out["rsi14"] = (
+                100.0 if avg_loss == 0
+                else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+            )
 
     except Exception as exc:
         log.debug("Momentum error: %s", exc)
@@ -377,11 +503,17 @@ def _momentum_metrics(ticker: str) -> dict[str, float | None]:
 # Aggregate metric collection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def collect_metrics(ticker: str, info: dict, financials, cashflow) -> dict[str, float | None]:
+def collect_metrics(
+    ticker: str,
+    info: dict,
+    financials,
+    cashflow,
+    balance_sheet,
+) -> dict[str, float | None]:
     mom = _momentum_metrics(ticker)
     return {
         # Value
-        "dcf_margin_of_safety": _dcf_margin_of_safety(info, financials, cashflow),
+        "dcf_margin_of_safety": _dcf_margin_of_safety(info, financials, cashflow, balance_sheet),
         "pe_ratio":             _pe_ratio(info),
         "pb_ratio":             _pb_ratio(info),
         "ev_ebitda":            _ev_ebitda(info),
@@ -389,6 +521,11 @@ def collect_metrics(ticker: str, info: dict, financials, cashflow) -> dict[str, 
         "revenue_cagr":         _revenue_cagr(financials),
         "eps_trend":            _eps_trend(financials),
         "fcf_trend":            _fcf_trend(cashflow),
+        # Profitability
+        "roe":                  _roe(info),
+        "roic":                 _roic(info),
+        "gross_margin":         _gross_margin(info),
+        "operating_margin":     _operating_margin(info),
         # Momentum
         "week52_percentile":    mom["week52_percentile"],
         "price_vs_ma50":        mom["price_vs_ma50"],
@@ -403,12 +540,12 @@ def collect_metrics(ticker: str, info: dict, financials, cashflow) -> dict[str, 
 
 def score(raw: dict[str, float | None]) -> tuple[float, dict, float]:
     """
-    Convert raw metrics → z-scores → pillar scores → composite z.
+    Raw metrics -> z-scores -> pillar scores -> composite z.
 
     Returns
     -------
     composite_z   : float
-    pillar_detail : dict   (transparent breakdown for the API response)
+    pillar_detail : dict
     data_coverage : float  (fraction of metrics successfully computed)
     """
 
@@ -419,7 +556,7 @@ def score(raw: dict[str, float | None]) -> tuple[float, dict, float]:
 
     data_coverage = len(zs) / len(raw) if raw else 0.0
 
-    # Step 2 — pillar scores (mean z of available metrics)
+    # Step 2 — pillar scores = mean z of available metrics
     pillar_z:      dict[str, float | None] = {}
     pillar_weight: dict[str, float]        = {}
 
@@ -432,27 +569,30 @@ def score(raw: dict[str, float | None]) -> tuple[float, dict, float]:
             pillar_z[name]      = None
             pillar_weight[name] = 0.0
 
-    # Step 3 — redistribute weight from empty pillars
+    # Step 3 — redistribute weight from pillars with no data
     active_weight = sum(w for p, w in pillar_weight.items() if pillar_z[p] is not None)
     eff_weight: dict[str, float] = {
-        p: (pillar_weight[p] / active_weight if active_weight > 0 and pillar_z[p] is not None else 0.0)
+        p: (
+            pillar_weight[p] / active_weight
+            if active_weight > 0 and pillar_z[p] is not None
+            else 0.0
+        )
         for p in PILLARS
     }
 
-    # Step 4 — composite z
+    # Step 4 — weighted composite z
     composite_z = sum(
         eff_weight[p] * pillar_z[p]
         for p in PILLARS
         if pillar_z[p] is not None
     )
 
-    # Build transparent pillar breakdown for the response
     pillar_detail = {
         p: {
-            "z_score":         round(pillar_z[p], 4) if pillar_z[p] is not None else None,
+            "z_score":          round(pillar_z[p], 4) if pillar_z[p] is not None else None,
             "effective_weight": round(eff_weight[p], 4),
-            "metrics_used":    [m for m in PILLARS[p]["metrics"] if m in zs],
-            "metrics_missing": [m for m in PILLARS[p]["metrics"] if m not in zs],
+            "metrics_used":     [m for m in PILLARS[p]["metrics"] if m in zs],
+            "metrics_missing":  [m for m in PILLARS[p]["metrics"] if m not in zs],
         }
         for p in PILLARS
     }
@@ -482,18 +622,18 @@ async def analyze(req: AnalyzeRequest):
     ticker = _validate_ticker(req.ticker)
     log.info("Analyzing %s", ticker)
 
-    stock      = yf.Ticker(ticker)
-    info       = stock.info
-    financials = stock.financials
-    cashflow   = stock.cashflow
+    stock         = yf.Ticker(ticker)
+    info          = stock.info
+    financials    = stock.financials
+    cashflow      = stock.cashflow
+    balance_sheet = stock.balance_sheet
 
-    # Minimal sanity check — yfinance returns an empty dict for unknown tickers
     if not info or not (info.get("currentPrice") or info.get("regularMarketPrice")):
         raise HTTPException(status_code=404, detail=f"No price data found for '{ticker}'")
 
-    raw_metrics             = collect_metrics(ticker, info, financials, cashflow)
+    raw_metrics                    = collect_metrics(ticker, info, financials, cashflow, balance_sheet)
     composite_z, pillars, coverage = score(raw_metrics)
-    prob                    = logistic(composite_z)
+    prob                           = logistic(composite_z)
 
     log.info(
         "%s | z=%.3f | p=%.3f | %s | coverage=%.0f%%",
@@ -509,7 +649,10 @@ async def analyze(req: AnalyzeRequest):
         "compositeZ":     round(composite_z, 4),
         "dataCoverage":   round(coverage, 4),
         "pillars":        pillars,
-        "rawMetrics":     {k: (round(v, 6) if v is not None else None) for k, v in raw_metrics.items()},
+        "rawMetrics":     {
+            k: (round(v, 6) if v is not None else None)
+            for k, v in raw_metrics.items()
+        },
     }
 
 
