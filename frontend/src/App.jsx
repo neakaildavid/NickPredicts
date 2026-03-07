@@ -1,6 +1,6 @@
 import { useState, useRef } from "react";
 
-// ─── Metric config — updated to match backend v2 rawMetrics keys ──────────────
+// ─── Metric config - updated to match backend v2 rawMetrics keys 
 const METRIC_CONFIG = {
   // Value
   dcf_mos:          { label: "DCF Margin of Safety", fmt: "pct", higher_is_better: true  },
@@ -48,7 +48,7 @@ const STEPS = [
   "Scoring quality metrics",
   "Scoring growth metrics",
   "Scoring momentum metrics",
-  "Applying guardrails & finalising",
+  "Applying guardrails & finalizing",
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -333,10 +333,10 @@ export default function App() {
       {/* Header */}
       <div style={{ textAlign: "center", padding: "52px 0 32px" }}>
         <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 10, letterSpacing: 6, color: "#38bdf8", marginBottom: 14 }}>
-          EQUITY INTELLIGENCE
+          NICK PREDICTS
         </div>
         <h1 style={{ fontFamily: "'DM Serif Display',serif", fontSize: "clamp(36px,7vw,66px)", margin: 0, lineHeight: 1, fontWeight: 400 }}>
-          Stock <em style={{ color: "#38bdf8" }}>Oracle</em>
+          Nick's Stock <em style={{ color: "#38bdf8" }}>Analyzer</em>
         </h1>
         <p style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 11, color: "#64748b", marginTop: 10, letterSpacing: 1 }}>
           DCF · Value · Quality · Growth · Momentum · Pure Quantitative
