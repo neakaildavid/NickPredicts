@@ -1,55 +1,30 @@
 """
-Stock Oracle — Institutional Multi-Factor Engine v2
-----------------------------------------------------
-Four-factor model inspired by AQR / Fama-French factor research.
-All data sourced from Yahoo Finance via yfinance.
+Nick's Stock Analyzer - Not a full buy/sell detector but rather an aid to research
+All data sourced from Yahoo Finance via yfinance
 
-Factors & weights
------------------
-  Value         (30%)  — DCF margin of safety (confidence-weighted),
+Factors/Weights:
+    Value (30%)    - DCF margin of safety (confidence-weighted),
                           EV/EBITDA, EV/FCF, trailing P/E, P/B
-  Quality       (25%)  — ROE, ROIC (ROA proxy), gross margin,
+    Quality (25%)  — ROE, ROIC (ROA proxy), gross margin,
                           operating margin, FCF margin
-  Growth        (25%)  — Revenue CAGR, EPS CAGR, operating income growth,
+    Growth (25%)   — Revenue CAGR, EPS CAGR, operating income growth,
                           FCF growth (only when FCF is stable)
-  Momentum      (20%)  — 12-month momentum, 6-month momentum,
+    Momentum (20%) — 12-month momentum, 6-month momentum,
                           price vs MA-200, volatility-adjusted return
 
-Scoring pipeline
-----------------
-  1. Each metric computed from yfinance data
-  2. Each metric converted to a 0–100 percentile score using empirically
+Scoring Pipeline:
+    1. Each metric computed from yfinance data
+    2. Each metric converted to a 0–100 percentile score using empirically
      calibrated market distributions (anchored at 5th / 95th percentiles
      of large-cap US equities).  Percentile scoring is more robust than
      z-scores because it does not assume normality and is bounded.
-  3. Factor score = mean percentile of available metrics in that factor
-  4. Composite score = weighted mean of available factor scores
+    3. Factor score = mean percentile of available metrics in that factor
+    4. Composite score = weighted mean of available factor scores
      (weights redistributed when a factor has no data)
-  5. Final score scaled 0–100.  Guardrails applied for low data coverage
+    5. Final score scaled 0–100.  Guardrails applied for low data coverage
      and negative fundamental signals.
-  6. Score → verdict band
-
-DCF specifics
--------------
-  - FCF stability is assessed before running DCF (CV of FCF series)
-  - When FCF is unstable, revenue-based growth is used as a proxy
-  - A DCF confidence score (0–1) scales its contribution to the Value factor
-  - Debt/cash pulled from balance sheet first, info dict as fallback
-  - Growth capped at [-5%, +20%]; terminal g = 2.5%
-
-Guardrails
-----------
-  - data_coverage < 0.50 → score penalised proportionally
-  - Negative revenue growth → Growth factor capped at 40/100
-  - Negative FCF (most recent year) → Quality factor capped at 45/100
-  - Negative operating margin → Quality factor capped at 45/100
-
-Missing data
-------------
-  Any metric that cannot be computed is dropped silently.
-  Its weight is redistributed proportionally to remaining metrics/factors.
+    6. Score → verdict band
 """
-
 import math
 import logging
 import re
@@ -61,9 +36,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
+#Logging
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,9 +44,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("stock_oracle")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# App
-# ─────────────────────────────────────────────────────────────────────────────
+#App
 
 app = FastAPI(title="Stock Oracle — Institutional Engine v2")
 
@@ -89,22 +60,10 @@ class AnalyzeRequest(BaseModel):
     ticker: str
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Percentile calibration tables
-# ─────────────────────────────────────────────────────────────────────────────
-# Each entry defines the p5 (bottom 5%) and p95 (top 5%) of the metric's
-# cross-sectional distribution across large-cap US equities.
-# Values outside this range are clamped before percentile scoring.
-#
-# For "lower is better" metrics (higher_is_better=False), the raw value is
-# negated before percentile scoring so that a higher percentile always means
-# "more attractive".
-#
-# Calibration sources: S&P 500 cross-sectional medians, Damodaran sector
-# data, academic factor literature (Fama-French, AQR).
+#Percentile Calibration Tables
 
 METRIC_CALIBRATION: dict[str, dict] = {
-    # ── Value ──────────────────────────────────────────────────────────────────
+    # Value -------------------------------------------------------------------
     # DCF margin of safety: (intrinsic - price) / price
     "dcf_mos":          {"p5": -0.60, "p95":  0.80, "higher_is_better": True},
     # EV / EBITDA
@@ -116,7 +75,7 @@ METRIC_CALIBRATION: dict[str, dict] = {
     # Price / Book
     "pb_ratio":         {"p5":  0.8,  "p95": 12.0,  "higher_is_better": False},
 
-    # ── Quality / Profitability ────────────────────────────────────────────────
+    # Quality -------------------------------------------------------------------
     # Return on Equity
     "roe":              {"p5":  0.02, "p95":  0.45, "higher_is_better": True},
     # Return on Assets (ROIC proxy)
@@ -128,7 +87,7 @@ METRIC_CALIBRATION: dict[str, dict] = {
     # FCF margin = FCF / revenue
     "fcf_margin":       {"p5": -0.05, "p95":  0.30, "higher_is_better": True},
 
-    # ── Growth ────────────────────────────────────────────────────────────────
+    # Growth ------------------------------------------------------------------
     # Revenue CAGR (annualised over available years)
     "revenue_cagr":     {"p5": -0.05, "p95":  0.30, "higher_is_better": True},
     # EPS CAGR (only when stable — both endpoints positive)
@@ -138,7 +97,7 @@ METRIC_CALIBRATION: dict[str, dict] = {
     # FCF growth (only when both years positive)
     "fcf_growth":       {"p5": -0.15, "p95":  0.40, "higher_is_better": True},
 
-    # ── Momentum ──────────────────────────────────────────────────────────────
+    # Momentum -------------------------------------------------------------------
     # 12-month price return (skip most recent month — standard momentum)
     "momentum_12m":     {"p5": -0.35, "p95":  0.65, "higher_is_better": True},
     # 6-month price return (skip most recent month)
@@ -148,10 +107,6 @@ METRIC_CALIBRATION: dict[str, dict] = {
     # Volatility-adjusted 12m return (return / annualised vol)
     "sharpe_12m":       {"p5": -1.50, "p95":  2.00, "higher_is_better": True},
 }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Factor membership & base weights
-# ─────────────────────────────────────────────────────────────────────────────
 
 FACTORS: dict[str, dict] = {
     "value": {
@@ -171,10 +126,6 @@ FACTORS: dict[str, dict] = {
         "weight":  0.20,
     },
 }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Core utilities
-# ─────────────────────────────────────────────────────────────────────────────
 
 def safe_float(x) -> float | None:
     """Return float or None; never raises."""
@@ -205,7 +156,6 @@ def to_percentile(metric: str, value: float) -> float:
     cal = METRIC_CALIBRATION[metric]
     v   = value if cal["higher_is_better"] else -value
 
-    # Negate calibration anchors for lower-is-better metrics too
     lo = cal["p5"]  if cal["higher_is_better"] else -cal["p95"]
     hi = cal["p95"] if cal["higher_is_better"] else -cal["p5"]
 
@@ -254,11 +204,6 @@ def verdict(score: float) -> str:
         return "SELL"
     return "STRONG SELL"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Balance sheet helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _get_debt_and_cash(balance_sheet, info: dict) -> tuple[float, float]:
     """
     (total_debt, cash) from balance sheet first, info dict as fallback.
@@ -304,9 +249,7 @@ def _get_debt_and_cash(balance_sheet, info: dict) -> tuple[float, float]:
     return float(total_debt), float(cash)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Value metrics
-# ─────────────────────────────────────────────────────────────────────────────
+#Value Metrics
 
 def _dcf(info: dict, financials, cashflow, balance_sheet) -> tuple[float | None, float]:
     """
@@ -342,7 +285,6 @@ def _dcf(info: dict, financials, cashflow, balance_sheet) -> tuple[float | None,
 
         total_debt, cash = _get_debt_and_cash(balance_sheet, info)
 
-        # ── WACC ────────────────────────────────────────────────────────────
         rf, erp, tax = 0.045, 0.055, 0.21
         ke = rf + beta * erp
 
@@ -356,7 +298,6 @@ def _dcf(info: dict, financials, cashflow, balance_sheet) -> tuple[float | None,
         total_cap = mkt_cap + total_debt
         wacc      = (mkt_cap / total_cap) * ke + (total_debt / total_cap) * kd * (1.0 - tax)
 
-        # ── FCF series ──────────────────────────────────────────────────────
         try:
             fcf_vals = list(reversed(cashflow.loc["Free Cash Flow"].dropna().tolist()))
         except Exception:
@@ -365,11 +306,9 @@ def _dcf(info: dict, financials, cashflow, balance_sheet) -> tuple[float | None,
         if len(fcf_vals) < 2:
             return None, 0.0
 
-        # Short history penalty
         if len(fcf_vals) < 3:
             confidence -= 0.20
 
-        # FCF volatility check
         cv = coefficient_of_variation(fcf_vals)
         if cv is not None:
             if cv > 1.0:
@@ -377,21 +316,17 @@ def _dcf(info: dict, financials, cashflow, balance_sheet) -> tuple[float | None,
             elif cv > 0.5:
                 confidence -= 0.15
 
-        # Negative base FCF
         fcf_base = fcf_vals[-1]
         if fcf_base <= 0:
             confidence -= 0.25
 
-        # ── Growth rate ─────────────────────────────────────────────────────
-        # Primary: FCF CAGR.  Fallback: revenue CAGR (with confidence penalty).
         growth = cagr(fcf_vals)
 
         if growth is None:
-            # FCF endpoints not both positive — use revenue growth as proxy
             try:
                 rev = list(reversed(financials.loc["Total Revenue"].dropna().tolist()))
                 growth = cagr(rev)
-                confidence -= 0.20   # penalise for using proxy growth
+                confidence -= 0.20   
             except Exception:
                 growth = None
 
@@ -404,10 +339,7 @@ def _dcf(info: dict, financials, cashflow, balance_sheet) -> tuple[float | None,
         if wacc <= terminal_g:
             return None, 0.0
 
-        # ── 5-year projection ───────────────────────────────────────────────
         if fcf_base <= 0:
-            # Cannot project from negative base; use absolute value but
-            # apply a heavy confidence penalty (already done above)
             fcf_base = abs(fcf_base)
             if fcf_base < 1:
                 return None, 0.0
@@ -420,7 +352,6 @@ def _dcf(info: dict, financials, cashflow, balance_sheet) -> tuple[float | None,
         intrinsic = ((pv_fcfs + pv_tv) - total_debt + cash) / shares
         mos       = (intrinsic - price) / price
 
-        # Extreme MoS is a sign of model noise, not signal — cap and penalise
         if abs(mos) > 2.0:
             confidence -= 0.20
             mos = np.clip(mos, -2.0, 2.0)
@@ -462,14 +393,10 @@ def _pb_ratio(info: dict) -> float | None:
     v = safe_float(info.get("priceToBook"))
     return v if v and v > 0 else None
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Quality / Profitability metrics
-# ─────────────────────────────────────────────────────────────────────────────
+# Quality Metrics
 
 def _roe(info: dict) -> float | None:
     v = safe_float(info.get("returnOnEquity"))
-    # Drop negative ROE — ambiguous signal (losses vs negative book equity)
     return v if v is not None and v > 0 else None
 
 
@@ -501,9 +428,7 @@ def _fcf_margin(info: dict, financials, cashflow) -> float | None:
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Growth metrics
-# ─────────────────────────────────────────────────────────────────────────────
+# Growth Metrics
 
 def _revenue_cagr(financials) -> float | None:
     try:
@@ -518,7 +443,7 @@ def _eps_cagr(financials) -> float | None:
     """EPS CAGR — only computed when both endpoints are positive."""
     try:
         eps = list(reversed(financials.loc["Diluted EPS"].dropna().tolist()))
-        return cagr(eps)   # cagr() already requires positive endpoints
+        return cagr(eps) 
     except Exception as exc:
         log.debug("EPS CAGR: %s", exc)
         return None
@@ -554,9 +479,7 @@ def _fcf_growth(cashflow) -> float | None:
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Momentum metrics
-# ─────────────────────────────────────────────────────────────────────────────
+# Momentum Metrics
 
 def _momentum_metrics(ticker: str) -> dict[str, float | None]:
     """
@@ -576,7 +499,6 @@ def _momentum_metrics(ticker: str) -> dict[str, float | None]:
     }
 
     try:
-        # 2 years guarantees 200-day MA and full momentum window
         hist   = yf.Ticker(ticker).history(period="2y")
         if hist.empty or len(hist) < 60:
             return out
@@ -584,7 +506,6 @@ def _momentum_metrics(ticker: str) -> dict[str, float | None]:
         closes = hist["Close"].dropna()
         n      = len(closes)
 
-        # Skip most recent ~21 trading days (1 month) per momentum convention
         skip = 21
         if n > skip + 252:
             ret_12m = float(closes.iloc[-(skip + 252)] )
@@ -601,7 +522,6 @@ def _momentum_metrics(ticker: str) -> dict[str, float | None]:
             ma200 = float(closes.iloc[-200:].mean())
             out["price_vs_ma200"] = (price / ma200) - 1.0
 
-        # Sharpe-like: annualised return / annualised vol over past 252 days
         if n >= 252:
             window  = closes.iloc[-252:]
             daily_r = window.pct_change().dropna()
@@ -616,9 +536,7 @@ def _momentum_metrics(ticker: str) -> dict[str, float | None]:
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Guardrails
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _compute_guardrail_flags(info: dict, financials, cashflow) -> dict:
     """
@@ -631,7 +549,6 @@ def _compute_guardrail_flags(info: dict, financials, cashflow) -> dict:
         "negative_operating_margin": False,
     }
 
-    # Negative revenue growth (most recent YoY)
     try:
         rev = list(reversed(financials.loc["Total Revenue"].dropna().tolist()))
         if len(rev) >= 2 and rev[-2] > 0:
@@ -640,7 +557,6 @@ def _compute_guardrail_flags(info: dict, financials, cashflow) -> dict:
     except Exception:
         pass
 
-    # Negative FCF (most recent year)
     try:
         fcf = safe_float(cashflow.loc["Free Cash Flow"].iloc[0])
         if fcf is not None and fcf < 0:
@@ -648,7 +564,6 @@ def _compute_guardrail_flags(info: dict, financials, cashflow) -> dict:
     except Exception:
         pass
 
-    # Negative operating margin
     try:
         om = safe_float(info.get("operatingMargins"))
         if om is not None and om < 0:
@@ -670,11 +585,9 @@ def _apply_guardrails(
     """
     s = dict(factor_scores)
 
-    # Negative revenue growth → cap Growth factor at 40
     if flags.get("negative_revenue_growth") and s.get("growth") is not None:
         s["growth"] = min(s["growth"], 40.0)
 
-    # Negative FCF or negative operating margin → cap Quality at 45
     if (flags.get("negative_fcf") or flags.get("negative_operating_margin")):
         if s.get("quality") is not None:
             s["quality"] = min(s["quality"], 45.0)
@@ -682,9 +595,7 @@ def _apply_guardrails(
     return s
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Aggregate metric collection
-# ─────────────────────────────────────────────────────────────────────────────
+# Metric Collection
 
 def collect_metrics(
     ticker: str,
@@ -731,9 +642,7 @@ def collect_metrics(
     return raw, dcf_mos, dcf_confidence
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Scoring engine
-# ─────────────────────────────────────────────────────────────────────────────
+# Scoring
 
 def score_metrics(
     raw: dict[str, float | None],
@@ -752,22 +661,15 @@ def score_metrics(
     factor_detail   : dict
     data_coverage   : float  (0–1)
     """
-
-    # Step 1 — percentile-score every available metric
     pscores: dict[str, float] = {}
     for metric, value in raw.items():
         if value is not None and metric in METRIC_CALIBRATION:
             pscores[metric] = to_percentile(metric, value)
-
-    # Apply DCF confidence weighting:
-    # Replace raw DCF percentile score with confidence-scaled version.
-    # A confidence of 0.5 pulls the DCF score halfway toward neutral (50).
     if "dcf_mos" in pscores:
         pscores["dcf_mos"] = 50.0 + (pscores["dcf_mos"] - 50.0) * dcf_confidence
 
     data_coverage = len(pscores) / len(raw) if raw else 0.0
 
-    # Step 2 — factor scores = mean percentile of available metrics
     factor_raw: dict[str, float | None] = {}
     factor_weight: dict[str, float]     = {}
 
@@ -779,26 +681,18 @@ def score_metrics(
         else:
             factor_raw[name]    = None
             factor_weight[name] = 0.0
-
-    # Step 3 — apply guardrails (caps on factor scores)
     factor_scores = _apply_guardrails(factor_raw, flags, data_coverage)
-
-    # Step 4 — redistribute weight from missing factors
     active_w = sum(w for f, w in factor_weight.items() if factor_scores[f] is not None)
     eff_weight: dict[str, float] = {
         f: (factor_weight[f] / active_w if active_w > 0 and factor_scores[f] is not None else 0.0)
         for f in FACTORS
     }
 
-    # Step 5 — composite score (0–100)
     composite = sum(
         eff_weight[f] * factor_scores[f]
         for f in FACTORS
         if factor_scores[f] is not None
     )
-
-    # Step 6 — data coverage penalty
-    # Below 50% coverage, linearly pull the score toward 50 (neutral)
     if data_coverage < 0.50:
         blend = data_coverage / 0.50   # 0 at 0% coverage, 1 at 50% coverage
         composite = 50.0 + (composite - 50.0) * blend
@@ -817,11 +711,6 @@ def score_metrics(
 
     return composite, factor_detail, data_coverage
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Input validation
-# ─────────────────────────────────────────────────────────────────────────────
-
 _TICKER_RE = re.compile(r"^[A-Z0-9.\-]{1,10}$")
 
 def _validate_ticker(raw: str) -> str:
@@ -830,10 +719,6 @@ def _validate_ticker(raw: str) -> str:
         raise HTTPException(status_code=400, detail=f"Invalid ticker: '{raw}'")
     return t
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Route
-# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
@@ -867,10 +752,8 @@ async def analyze(req: AnalyzeRequest):
         "ticker":          ticker,
         "companyName":     info.get("longName", ticker),
         "currentPrice":    safe_float(info.get("currentPrice")),
-        # Primary output
         "score":           round(composite, 1),
         "verdict":         verdict(composite),
-        # Supporting detail
         "dcfConfidence":   round(dcf_confidence, 3),
         "dataCoverage":    round(coverage, 4),
         "guardrailFlags":  flags,
