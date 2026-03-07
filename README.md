@@ -1,6 +1,6 @@
-# Stock Oracle
+# Nick's Stock Analyzer
 
-Stock Oracle is a quantitative stock analysis tool I built to help cut through the noise when researching equities. You type in a ticker, it pulls financial data from Yahoo Finance, and it returns a score from 0 to 100 based purely on the numbers — no news, no sentiment, no narrative. Just math.
+Stock Analyzer is a quantitative stock analysis tool I built to help cut through the noise when researching equities. You type in a ticker, it pulls financial data from Yahoo Finance, and it returns a score from 0 to 100 based purely on the numbers — no news, no sentiment, no narrative. Just math.
 
 The idea came from frustration with the usual approach to stock research, where you end up reading analyst reports full of qualitative language and walking away with no clearer picture than when you started. This tool doesn't tell you a story. It crunches the financials and tells you where a company stands relative to the rest of the market across four dimensions: how cheap it is, how well-run it is, how fast it's growing, and what the price trend is doing.
 
